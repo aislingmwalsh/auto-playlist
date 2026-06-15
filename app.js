@@ -14,6 +14,11 @@ const elements = {
 
 const REDIRECT_URI = window.location.origin + window.location.pathname;
 
+// --- SPOTIFY URLS (Safeguarded) ---
+const SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize";
+const SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token";
+const SPOTIFY_API_BASE = "https://api.spotify.com/v1";
+
 // --- INITIALISE APP & KEYS ---
 function loadKeys() {
     elements.setlistKeyInput.value = localStorage.getItem('setlist_api_key') || '';
@@ -70,7 +75,7 @@ async function redirectToSpotifyAuth() {
     const codeChallenge = base64urlencode(hashed);
 
     const scope = 'playlist-modify-public playlist-modify-private';
-    const authUrl = new URL("https://accounts.spotify.com/authorize");
+    const authUrl = new URL(SPOTIFY_AUTH_URL);
 
     const params = {
         response_type: 'code',
@@ -108,7 +113,7 @@ async function handleSpotifyCallback() {
     };
 
     try {
-        const res = await fetch('https://accounts.spotify.com/api/token', payload);
+        const res = await fetch(SPOTIFY_TOKEN_URL, payload);
         const data = await res.json();
         
         if (data.access_token) {
@@ -175,11 +180,9 @@ elements.generateBtn.onclick = async () => {
             return showDate <= today;
         });
 
-        // Grab up to the 5 most recent shows from the cleaned list
         const recentShows = pastShows.slice(0, 5); 
         const playlistName = `${artist} — Ultimate Tour Setlist`;
         
-        // Use a Set to automatically prevent duplicate tracks
         let uniqueTracks = new Set();
         let showCount = 0;
 
@@ -205,7 +208,8 @@ elements.generateBtn.onclick = async () => {
         await buildSpotifyPlaylist(playlistName, tracks, artist, spotifyToken);
 
     } catch (err) {
-        log("Failed gathering data. Ensure you have unlocked proxy access.", true);
+        // Updated to show the exact error message!
+        log(`System Error: ${err.message}. Please check the console for more details.`, true);
         console.error(err);
     }
 };
@@ -213,74 +217,86 @@ elements.generateBtn.onclick = async () => {
 async function buildSpotifyPlaylist(name, tracks, artist, token) {
     log("Connecting to Spotify API...");
     
-    const userRes = await fetch('https://api.spotify.com/v1/me', {
-        headers: { 'Authorization': `Bearer ${token}` }
-    });
-    
-    if (userRes.status === 401) {
-        log("Spotify access expired. Re-authorising...", true);
-        localStorage.removeItem('spotify_token');
-        redirectToSpotifyAuth();
-        return;
-    }
-    
-    const userData = await userRes.json();
-    const userId = userData.id;
-
-    let trackUris = [];
-    for (let track of tracks) {
-        if (!track) continue;
-        const query = encodeURIComponent(`track:${track} artist:${artist}`);
-        const searchRes = await fetch(`https://api.spotify.com/v1/search?q=${query}&type=track&limit=1`, {
+    try {
+        // 1. Get User Profile
+        const userRes = await fetch(`${SPOTIFY_API_BASE}/me`, {
             headers: { 'Authorization': `Bearer ${token}` }
         });
-        const searchData = await searchRes.json();
         
-        if (searchData.tracks?.items?.length > 0) {
-            trackUris.push(searchData.tracks.items[0].uri);
-            log(`Found: ${track}`);
-        } else {
-            log(`⚠️ Missed: ${track}`, true);
+        if (!userRes.ok) {
+            log("Spotify access expired. Re-authorising...", true);
+            localStorage.removeItem('spotify_token');
+            setTimeout(redirectToSpotifyAuth, 1000);
+            return;
         }
-    }
+        
+        const userData = await userRes.json();
+        const userId = userData.id;
 
-    if (trackUris.length === 0) {
-        log("No matching tracks resolved on Spotify. Aborting.", true);
-        return;
-    }
+        // 2. Search for Tracks
+        let trackUris = [];
+        for (let track of tracks) {
+            if (!track) continue;
+            const query = encodeURIComponent(`track:${track} artist:${artist}`);
+            const searchRes = await fetch(`${SPOTIFY_API_BASE}/search?q=${query}&type=track&limit=1`, {
+                headers: { 'Authorization': `Bearer ${token}` }
+            });
+            const searchData = await searchRes.json();
+            
+            if (searchData.tracks?.items?.length > 0) {
+                trackUris.push(searchData.tracks.items[0].uri);
+                log(`Found: ${track}`);
+            } else {
+                log(`⚠️ Missed: ${track}`, true);
+            }
+        }
 
-    log(`Creating playlist: "${name}"...`);
-    const playlistRes = await fetch(`https://api.spotify.com/v1/users/${userId}/playlists`, {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ 
-            name: name, 
-            description: 'A custom aggregation of the 5 most recent Setlist.fm shows.', 
-            public: true 
-        })
-    });
-    const playlistData = await playlistRes.json();
+        if (trackUris.length === 0) {
+            log("No matching tracks resolved on Spotify. Aborting.", true);
+            return;
+        }
 
-    // Spotify has a 100-track limit per upload request. 
-    for (let i = 0; i < trackUris.length; i += 100) {
-        const chunk = trackUris.slice(i, i + 100);
-        await fetch(`https://api.spotify.com/v1/playlists/${playlistData.id}/tracks`, {
+        // 3. Create the Playlist
+        log(`Creating playlist: "${name}"...`);
+        const playlistRes = await fetch(`${SPOTIFY_API_BASE}/users/${userId}/playlists`, {
             method: 'POST',
             headers: {
                 'Authorization': `Bearer ${token}`,
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify({ uris: chunk })
+            body: JSON.stringify({ 
+                name: name, 
+                description: 'A custom aggregation of the 5 most recent Setlist.fm shows.', 
+                public: true 
+            })
         });
-    }
+        
+        if (!playlistRes.ok) throw new Error("Failed to construct the new playlist on Spotify.");
+        const playlistData = await playlistRes.json();
 
-    const playlistUrl = playlistData.external_urls.spotify;
-    
-    log(`🎉 Success! Playlist generated seamlessly.`);
-    log(`<a href="${playlistUrl}" target="_blank" class="text-green-400 hover:text-green-300 underline font-bold mt-2 inline-block">🔗 Click here to open and share your new playlist</a>`);
+        // 4. Inject the Tracks
+        for (let i = 0; i < trackUris.length; i += 100) {
+            const chunk = trackUris.slice(i, i + 100);
+            const addRes = await fetch(`${SPOTIFY_API_BASE}/playlists/${playlistData.id}/tracks`, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${token}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ uris: chunk })
+            });
+            if (!addRes.ok) throw new Error("Failed to add the compiled tracks into the playlist.");
+        }
+
+        const playlistUrl = playlistData.external_urls.spotify;
+        
+        log(`🎉 Success! Playlist generated seamlessly.`);
+        log(`<a href="${playlistUrl}" target="_blank" class="text-green-400 hover:text-green-300 underline font-bold mt-2 inline-block">🔗 Click here to open and share your new playlist</a>`);
+
+    } catch (err) {
+        log(`Spotify Error: ${err.message}`, true);
+        console.error(err);
+    }
 }
 
 // Run on page boot
