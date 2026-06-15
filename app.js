@@ -39,38 +39,98 @@ elements.saveSettings.onclick = () => {
 function log(message, isError = false) {
     elements.statusLog.classList.remove('hidden');
     const color = isError ? 'text-red-400' : 'text-zinc-300';
-    elements.statusLog.innerHTML += `<div class="${color}">&gt; ${message}</div>`;
+    elements.statusLog.innerHTML += `<div class="${color}">> ${message}</div>`;
     elements.statusLog.scrollTop = elements.statusLog.scrollHeight;
 }
 
-// --- SPOTIFY OAUTH MANAGEMENT ---
-// Check if URL contains an access token returned from Spotify authentication
-function getSpotifyToken() {
-    const hash = window.location.hash.substring(1);
-    const params = new URLSearchParams(hash);
-    const token = params.get('access_token');
-    
-    if (token) {
-        localStorage.setItem('spotify_token', token);
-        // Clear hash from URL cleanly
-        window.history.replaceState(null, null, window.location.pathname);
-        return token;
-    }
-    return localStorage.getItem('spotify_token');
+// --- PKCE CRYPTO HELPERS ---
+function generateRandomString(length) {
+    const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    const values = crypto.getRandomValues(new Uint8Array(length));
+    return Array.from(values).map((x) => possible[x % possible.length]).join('');
 }
 
-function redirectToSpotifyAuth() {
+async function sha256(plain) {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(plain);
+    return crypto.subtle.digest('SHA-256', data);
+}
+
+function base64urlencode(a) {
+    return btoa(String.fromCharCode.apply(null, new Uint8Array(a)))
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+// --- SPOTIFY OAUTH (PKCE) MANAGEMENT ---
+async function redirectToSpotifyAuth() {
     const clientId = localStorage.getItem('spotify_client_id');
-    const scope = encodeURIComponent('playlist-modify-public playlist-modify-private');
-    const authUrl = `https://accounts.spotify.com/authorize?client_id=${clientId}&response_type=token&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&scope=${scope}`;
-    window.location.href = authUrl;
+    const codeVerifier = generateRandomString(64);
+    localStorage.setItem('spotify_code_verifier', codeVerifier);
+
+    const hashed = await sha256(codeVerifier);
+    const codeChallenge = base64urlencode(hashed);
+
+    const scope = 'playlist-modify-public playlist-modify-private';
+    const authUrl = new URL("https://accounts.spotify.com/authorize");
+
+    const params = {
+        response_type: 'code',
+        client_id: clientId,
+        scope: scope,
+        code_challenge_method: 'S256',
+        code_challenge: codeChallenge,
+        redirect_uri: REDIRECT_URI,
+    };
+
+    authUrl.search = new URLSearchParams(params).toString();
+    window.location.href = authUrl.toString();
 }
 
-// --- CORE LOGIC ---
+async function handleSpotifyCallback() {
+    const urlParams = new URLSearchParams(window.location.search);
+    const code = urlParams.get('code');
+    
+    if (!code) return localStorage.getItem('spotify_token');
+
+    log("Exchanging authorization code for access token...");
+    const clientId = localStorage.getItem('spotify_client_id');
+    const codeVerifier = localStorage.getItem('spotify_code_verifier');
+
+    const payload = {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+            client_id: clientId,
+            grant_type: 'authorization_code',
+            code: code,
+            redirect_uri: REDIRECT_URI,
+            code_verifier: codeVerifier,
+        }),
+    };
+
+    try {
+        const res = await fetch('https://accounts.spotify.com/api/token', payload);
+        const data = await res.json();
+        
+        if (data.access_token) {
+            localStorage.setItem('spotify_token', data.access_token);
+            // Clean up URL parameters cleanly
+            window.history.replaceState(null, null, window.location.pathname);
+            log("Authentication successful!");
+            return data.access_token;
+        }
+    } catch (err) {
+        log("Failed to swap token via PKCE.", true);
+        console.error(err);
+    }
+    return null;
+}
+
+// --- CORE GATHER & BUILD LOGIC ---
 elements.generateBtn.onclick = async () => {
     const artist = elements.artistInput.value.trim();
     const setlistKey = localStorage.getItem('setlist_api_key');
-    const spotifyToken = getSpotifyToken();
+    const spotifyToken = localStorage.getItem('spotify_token');
 
     if (!artist || !setlistKey) {
         alert("Please specify an artist and ensure API configuration keys are saved.");
@@ -83,10 +143,9 @@ elements.generateBtn.onclick = async () => {
         return;
     }
 
-    elements.statusLog.innerHTML = ''; // reset log
+    elements.statusLog.innerHTML = '';
     log(`Searching for ${artist} on Setlist.fm...`);
 
-    // 1. Fetch from Setlist.fm via public CORS proxy
     const proxyUrl = "https://cors-anywhere.herokuapp.com/"; 
     const targetUrl = `https://api.setlist.fm/rest/1.0/search/setlists?artistName=${encodeURIComponent(artist)}`;
     
@@ -116,8 +175,6 @@ elements.generateBtn.onclick = async () => {
         });
 
         log(`Found ${tracks.length} tracks from recent show at ${venue}.`);
-        
-        // 2. Resolve Tracks on Spotify & Compile Playlist
         await buildSpotifyPlaylist(playlistName, tracks, artist, spotifyToken);
 
     } catch (err) {
@@ -129,7 +186,6 @@ elements.generateBtn.onclick = async () => {
 async function buildSpotifyPlaylist(name, tracks, artist, token) {
     log("Connecting to Spotify API...");
     
-    // Get Spotify User ID
     const userRes = await fetch('https://api.spotify.com/v1/me', {
         headers: { 'Authorization': `Bearer ${token}` }
     });
@@ -144,7 +200,6 @@ async function buildSpotifyPlaylist(name, tracks, artist, token) {
     const userData = await userRes.json();
     const userId = userData.id;
 
-    // Search for track URIs
     let trackUris = [];
     for (let track of tracks) {
         if (!track) continue;
@@ -167,7 +222,6 @@ async function buildSpotifyPlaylist(name, tracks, artist, token) {
         return;
     }
 
-    // Create New Playlist
     log(`Creating playlist: "${name}"...`);
     const playlistRes = await fetch(`https://api.spotify.com/v1/users/${userId}/playlists`, {
         method: 'POST',
@@ -179,7 +233,6 @@ async function buildSpotifyPlaylist(name, tracks, artist, token) {
     });
     const playlistData = await playlistRes.json();
 
-    // Push tracks into playlist
     await fetch(`https://api.spotify.com/v1/playlists/${playlistData.id}/tracks`, {
         method: 'POST',
         headers: {
@@ -194,4 +247,4 @@ async function buildSpotifyPlaylist(name, tracks, artist, token) {
 
 // Run on page boot
 loadKeys();
-getSpotifyToken();
+handleSpotifyCallback();
