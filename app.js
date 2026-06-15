@@ -26,7 +26,6 @@ function loadKeys() {
     }
 }
 
-// Modal visibility toggles
 elements.settingsBtn.onclick = () => elements.settingsModal.classList.remove('hidden');
 elements.closeSettings.onclick = () => elements.settingsModal.classList.add('hidden');
 elements.saveSettings.onclick = () => {
@@ -92,7 +91,7 @@ async function handleSpotifyCallback() {
     
     if (!code) return localStorage.getItem('spotify_token');
 
-    log("Exchanging authorization code for access token...");
+    log("Exchanging authorisation code for access token...");
     const clientId = localStorage.getItem('spotify_client_id');
     const codeVerifier = localStorage.getItem('spotify_code_verifier');
 
@@ -114,7 +113,6 @@ async function handleSpotifyCallback() {
         
         if (data.access_token) {
             localStorage.setItem('spotify_token', data.access_token);
-            // Clean up URL parameters cleanly
             window.history.replaceState(null, null, window.location.pathname);
             log("Authentication successful!");
             return data.access_token;
@@ -138,7 +136,7 @@ elements.generateBtn.onclick = async () => {
     }
 
     if (!spotifyToken) {
-        log("Redirecting to Spotify for login authorization...");
+        log("Redirecting to Spotify for login authorisation...");
         setTimeout(redirectToSpotifyAuth, 1000);
         return;
     }
@@ -163,18 +161,47 @@ elements.generateBtn.onclick = async () => {
         }
 
         const data = await response.json();
-        const mostRecentSetlist = data.setlist[0];
         
-        const venue = mostRecentSetlist.venue.name;
-        const city = mostRecentSetlist.venue.city.name;
-        const playlistName = `${artist} — ${venue}, ${city} (${mostRecentSetlist.eventDate})`;
-        
-        let tracks = [];
-        mostRecentSetlist.sets.set.forEach(s => {
-            s.song.forEach(song => tracks.push(song.name));
+        // --- TIME FILTERING LOGIC ---
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+
+        const pastShows = data.setlist.filter(show => {
+            if (!show.eventDate) return false;
+            
+            const [day, month, year] = show.eventDate.split('-');
+            const showDate = new Date(`${year}-${month}-${day}`);
+            
+            return showDate <= today;
         });
 
-        log(`Found ${tracks.length} tracks from recent show at ${venue}.`);
+        // Grab up to the 5 most recent shows from the cleaned list
+        const recentShows = pastShows.slice(0, 5); 
+        const playlistName = `${artist} — Ultimate Tour Setlist`;
+        
+        // Use a Set to automatically prevent duplicate tracks
+        let uniqueTracks = new Set();
+        let showCount = 0;
+
+        recentShows.forEach(show => {
+            if (show.sets && show.sets.set && show.sets.set.length > 0) {
+                showCount++;
+                show.sets.set.forEach(s => {
+                    s.song.forEach(song => {
+                        if (song.name) uniqueTracks.add(song.name);
+                    });
+                });
+            }
+        });
+
+        const tracks = Array.from(uniqueTracks);
+
+        if (tracks.length === 0) {
+            log("Could not find any songs in the recent setlists.", true);
+            return;
+        }
+
+        log(`Aggregated ${tracks.length} unique tracks across ${showCount} recent shows.`);
         await buildSpotifyPlaylist(playlistName, tracks, artist, spotifyToken);
 
     } catch (err) {
@@ -229,20 +256,31 @@ async function buildSpotifyPlaylist(name, tracks, artist, token) {
             'Authorization': `Bearer ${token}`,
             'Content-Type': 'application/json'
         },
-        body: JSON.stringify({ name: name, description: 'Generated from Setlist.fm', public: true })
+        body: JSON.stringify({ 
+            name: name, 
+            description: 'A custom aggregation of the 5 most recent Setlist.fm shows.', 
+            public: true 
+        })
     });
     const playlistData = await playlistRes.json();
 
-    await fetch(`https://api.spotify.com/v1/playlists/${playlistData.id}/tracks`, {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ uris: trackUris })
-    });
+    // Spotify has a 100-track limit per upload request. 
+    for (let i = 0; i < trackUris.length; i += 100) {
+        const chunk = trackUris.slice(i, i + 100);
+        await fetch(`https://api.spotify.com/v1/playlists/${playlistData.id}/tracks`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ uris: chunk })
+        });
+    }
 
-    log(`🎉 Success! Playlist generated seamlessly inside your Spotify Client.`);
+    const playlistUrl = playlistData.external_urls.spotify;
+    
+    log(`🎉 Success! Playlist generated seamlessly.`);
+    log(`<a href="${playlistUrl}" target="_blank" class="text-green-400 hover:text-green-300 underline font-bold mt-2 inline-block">🔗 Click here to open and share your new playlist</a>`);
 }
 
 // Run on page boot
