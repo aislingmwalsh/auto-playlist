@@ -77,13 +77,14 @@ async function redirectToSpotifyAuth() {
     const scope = 'playlist-modify-public playlist-modify-private user-read-private';
     const authUrl = new URL(SPOTIFY_AUTH_URL);
 
-    const params = {
+const params = {
         response_type: 'code',
         client_id: clientId,
         scope: scope,
         code_challenge_method: 'S256',
         code_challenge: codeChallenge,
         redirect_uri: REDIRECT_URI,
+        show_dialog: 'true' // <--- This forces the permission screen to appear
     };
 
     authUrl.search = new URLSearchParams(params).toString();
